@@ -1,0 +1,68 @@
+#!/usr/local/bin/Rscript
+# Load the argparse library:
+
+error <- function(msg){
+    writeLines(sprintf('ERROR: %s', msg), con=stderr())
+    quit('no')
+}
+
+if(!identical(suppressWarnings(suppressPackageStartupMessages(require(argparse))), TRUE)) error('R package "argparse" is not installed')
+
+# Create the argument parser:
+parser <- ArgumentParser()
+parser$add_argument('-t', '--title', dest='title', type='character', help='plot title')
+parser$add_argument('-w', '--width', dest='width', type='double', default=16, help='PDF width (in inches)')
+parser$add_argument('-e', '--height', dest='height', type='double', default=8, help='PDF height (in inches)')
+parser$add_argument('-s', '--pointsize', dest='pointsize', type='double', default=16, help='PDF pointsize')
+parser$add_argument('-m', '--margin', dest='margin', type='double', default=7, help='PDF lower margin')
+parser$add_argument('-l', '--legend', dest='legend_pos', type='character', default='topright', choices=c('none', 'bottomright', 'bottom', 'bottomleft', 'left', 'topleft', 'top', 'topright', 'right', 'center'), help='show legend')
+parser$add_argument(dest='input_file', type='character', help='input cutadapt statistics file')
+parser$add_argument(dest='output_file', type='character', help='output PDF file')
+args <- parser$parse_args()
+
+# Load the input data:
+res <- try ({
+    d <- read.table(args$input_file, sep='\t', comment.char='#', colClasses=c(rep('character', 2), 'factor', rep('numeric', 11)), row.names=1)
+    colnames(d) <- c('file', 'type', 'r_total', 'b_total', 'r_out', 'b_out', 'r_adapt', 'r_rm_long', 'r_rm_short', 'r_rm_other', 'b_rm_adapt', 'b_rm_qual', 'b_rm_other')    
+}, silent=TRUE)
+if(class(res) == 'try-error') error(sprintf('Failed to load input file "%s"', args$input_file))
+
+res <- try({
+    # Sort the bases by total, then pair:
+    d <- d[order(d$b_total, c('pair_1'=2, 'pair_2'=1)[as.character(d$type)], decreasing=TRUE),]
+
+    # Extract the data:
+    b <- t(as.matrix(data.frame(
+        'untrimmed' = d$b_out,
+        'adapter' = d$b_rm_adapt,
+        'other' = d$b_rm_qual + d$b_rm_other,
+        row.names = rownames(d)
+    )))
+
+    # Sort the axis:
+    axis.multiplier <- floor(log10(max(d$b_total)) / 3) * 3
+    axis.max <- ceiling(max(d$b_total) / (10**axis.multiplier))
+    axis.pos <- pretty(c(0, axis.max))    
+}, silent=TRUE)
+if(class(res) == 'try-error') error('Failed to process cutadapt statistics')
+
+# Set the colours:
+colours <- c('untrimmed'='#91CF60', 'adapter'='#FFFFBF', 'other'='#FC8D59')
+
+# Generate the plot:
+res <- try({
+    pdf(args$output_file, width=args$width, height=args$height, pointsize=args$pointsize)
+    if(is.null(args$title)) top.margin <- 0
+    else top.margin <- 3
+    par(las=2, mar=c(args$margin, 4, top.margin, 0) + 0.5)
+    x <- barplot(b, col=colours, axes=FALSE)
+    axis(2, at=axis.pos * (10**axis.multiplier), labels=axis.pos)
+    title(ylab=substitute(nucleotides%*%10^i, list(i=axis.multiplier)))
+    if(!is.null(args$title)) title(main=args$title)
+    if(args$legend != 'none') legend(args$legend, legend=names(colours), fill=colours, bty='n')
+    dev.off()    
+}, silent=TRUE)
+if(class(res) == 'try-error') error(sprintf('Failed to create output file "%s"', args$output_file))
+
+# Close:
+quit('no')

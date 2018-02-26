@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import argparse
+import re
+from sys import exit
+from datetime import date
+import os.path
+
+version = '1.4 (2018-02-26)'
+
+epilog = '\n'.join([
+'For each log file, either a single entry (if it was a single read) or two',
+'entries (if it was a pair) are returned. The output columns are:',
+' id        : The log file ID',
+' file      : The log file',
+' type      : The type',
+' r_total   : Total reads processed',
+' b_total   : Total bases processed',
+' r_out     : Total reads passing filter',
+' b_out     : Total bases passing filter',
+' r_adapt   : Number of reads with adapter contamination',
+' r_rm_long : Reads rejected as too long (flag -M)',
+' r_rm_short: Reads rejected as too short (flag -m',
+' r_rm_other: Reads rejected for any other reason',
+' b_rm_adapt: Bases trimmed as adapter',
+' b_rm_qual : Bases trimmed as low quality (flag -q)',
+' b_rm_other: Reads trimmed for any other reason'
+])
+
+parser = argparse.ArgumentParser(description='Summarize cutadapt log files', epilog=epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
+parser.add_argument('-v', '--version', action='version', version='%(prog)s {0}'.format(version))
+output_options = parser.add_mutually_exclusive_group()
+output_options.add_argument('-n', '--no-header', dest='header', action='store_false', default=True, help='suppress column headers')
+output_options.add_argument('-c', '--csv', dest='csv', action='store_true', default=False, help='output data as CSV (ignores -n)')
+parser.add_argument(dest='filenames', metavar='<filename>', nargs='+', help='cutadapt log file(s) to process')
+args = parser.parse_args()
+
+columns = ('id', 'file', 'type', 'r_total', 'b_total', 'r_out', 'b_out', 'r_adapt', 'r_rm_long', 'r_rm_short', 'r_rm_other', 'b_rm_adapt', 'b_rm_qual' , 'b_rm_other')
+
+adapter_re = re.compile('^(\d+)\t(\d+)\t(?:[.\d]+)\t(?:\d+)\t(?:\d+)', re.MULTILINE)
+global_re = {
+    'total': re.compile('^Total read(?: pair)?s processed:\s*([\d,]+)', re.MULTILINE),
+    'short': re.compile('^\s*(?:Reads|Pairs) that were too short:\s*([\d,]+)', re.MULTILINE),
+    'long': re.compile('^\s*(?:Reads|Pairs) that were too long:\s*([\d,]+)', re.MULTILINE),
+    'ok': re.compile('^\s*(?:Reads|Pairs) written \(passing filters\):\s*([\d,]+)', re.MULTILINE)
+}
+def re_list(*x): return [re.compile(i, re.MULTILINE) for i in x]
+specific_re = {
+    'adapter': re_list('^Reads with adapters:\s*([\d,]+)', '^\s*Read 1 with adapter:\s*([\d,]+)', '^\s*Read 2 with adapter:\s*([\d,]+)'),
+    'total': re_list('^Total basepairs processed:\s*([\d,]+)', '^Total basepairs processed:\s*[\d,]+ bp\n\s+Read 1:\s+([\d,]+)', '^Total basepairs processed:\s*[\d,]+ bp\n\s+Read 1:\s+[\d,]+ bp\n\s+Read 2:\s+([\d,]+)'),
+    'quality': re_list('^Quality-trimmed:\s*([\d,]+)', '^Quality-trimmed:\s*[\d,]+ bp \([\d.]+%\)\n\s+Read 1:\s+([\d,]+)', '^Quality-trimmed:\s*[\d,]+ bp \([\d.]+%\)\n\s+Read 1:\s+[\d,]+ bp\n\s+Read 2:\s+([\d,]+)'),
+    'ok': re_list('^Total written \(filtered\):\s*([\d,]+)', '^Total written \(filtered\):\s*[\d,]+ bp \([\d.]+%\)\n\s+Read 1:\s+([\d,]+)', '^Total written \(filtered\):\s*[\d,]+ bp \([\d.]+%\)\n\s+Read 1:\s+[\d,]+ bp\n\s+Read 2:\s+([\d,]+)')
+}
+
+def guess_type(data):
+    if 'Total read pairs processed' in data: return 'paired'
+    if 'Total reads processed' in data: return 'single'
+    raise ValueError('Unknown file type')
+
+def adapter_basecount(data, adapter_re):
+    total = 0
+    for match in re.finditer(adapter_re, data):
+        total += int(match.group(1)) * int(match.group(2))
+    return total
+
+def match_single(regex, data, group=1, unmatched=0):
+    try: return int(regex.search(data).group(group).replace(',', ''))
+    except: return unmatched
+
+def match_single_group(regex, ptype, data, group=1, unmatched=0):
+    i = {'single':0, 'pair_1':1, 'pair_2':2}[ptype]
+    return match_single(regex[i], data=data, group=group, unmatched=unmatched)
+
+def parse_cutadapt(filename):
+    f = open(filename, 'rt')
+    file_data = f.read()
+    file_parts = re.split('^=== (.*) ===', file_data, flags=re.MULTILINE)
+    f.close()
+    file_type = guess_type(file_data)
+    b_adapter = [0, 0]
+    for section in range(3, len(file_parts), 2):
+        adapter = file_parts[section].strip()
+        total = adapter_basecount(file_parts[section + 1], adapter_re)
+        if 'Second read:' in adapter: b_adapter[1] += total
+        else: b_adapter[0] += total
+    output = []
+    for pair in ['1', '2']:
+        if (pair == '2') and (file_type == 'single'): break
+        output.append({})
+        i = len(output) - 1
+        output[i]['id'] = '{}-{}'.format(os.path.splitext(os.path.basename(filename))[0].split('-')[1], pair)
+        output[i]['file'] = os.path.splitext(os.path.basename(filename))[0].split('-')[1]
+        if file_type == 'single': ptype = 'single'
+        else: ptype = 'pair_{}'.format(pair)
+        output[i]['type'] = ptype
+        output[i]['r_total'] = match_single(global_re['total'], file_parts[2])
+        output[i]['b_total'] = match_single_group(specific_re['total'], ptype, file_parts[2])
+        output[i]['r_out'] = match_single(global_re['ok'], file_parts[2])
+        output[i]['b_out'] = match_single_group(specific_re['ok'], ptype, file_parts[2])
+        output[i]['r_adapt'] = match_single_group(specific_re['adapter'], ptype, file_parts[2])
+        output[i]['r_rm_short'] = match_single(global_re['short'], file_parts[2])
+        output[i]['r_rm_long'] = match_single(global_re['long'], file_parts[2])
+        output[i]['r_rm_other'] = (output[i]['r_total'] - output[i]['r_out']) - (output[i]['r_rm_short'] + output[i]['r_rm_long']) 
+        if ptype == 'pair_2': output[i]['b_rm_adapt'] = b_adapter[1]
+        else: output[i]['b_rm_adapt'] = b_adapter[0]
+        output[i]['b_rm_qual'] = match_single_group(specific_re['quality'], ptype, file_parts[2])
+        output[i]['b_rm_other'] = (output[i]['b_total'] - output[i]['b_out']) - (output[i]['b_rm_adapt'] + output[i]['b_rm_qual']) 
+    return(output)
+
+file_data = []
+for filename in args.filenames:
+    try: file_data.extend(parse_cutadapt(filename))
+    except: exit('ERROR: Failed to process "{}".'.format(filename))
+
+if args.csv == True:
+    output_string = ','.join(['"{{{}}}"'.format(columns[i]) for i in range(len(columns))])
+    print(output_string.format(**dict([(i, i) for i in columns])))
+else:
+    if args.header == True: print('{}'.format('\t'.join(columns)))
+    output_string = '\t'.join(['{{{}}}'.format(columns[i]) for i in range(len(columns))])
+for i in file_data: print(output_string.format(**i))
